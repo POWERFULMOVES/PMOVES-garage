@@ -1,0 +1,180 @@
+name: PMOVES GHCR image
+
+# Builds Garage the way upstream releases it and publishes a multi-arch
+# (amd64 + arm64) image to GHCR for PMOVES.AI.
+#
+# Build method is upstream's, unchanged (v2.4.1):
+#   .woodpecker/release.yaml  "build":   nix-build --attr releasePackages.${ARCH}
+#                                        --argstr git_version <tag or sha>
+#                             "check is static binary": script/not-dynamic.sh
+#                             "integration tests" (amd64): script/test-smoke.sh
+#   Dockerfile                FROM scratch + COPY result/bin/garage (packages the
+#                             Nix output; it does not compile anything itself)
+# Upstream publishes with kaniko + manifest-tool (shell.nix to_docker /
+# multiarch_docker). Here buildx pushes each arch by digest and a merge job
+# assembles the manifest list, per Docker's "distribute build across multiple
+# runners" pattern. Both arches cross-compile on one amd64 runner exactly as
+# upstream's matrix does; the image has no RUN step, so no QEMU is needed.
+#
+# GHCR naming and GITHUB_TOKEN auth follow the PMOVES fork precedent
+# POWERFULMOVES/PMOVES-DoX .github/workflows/docker-publish.yml.
+#
+# PMOVES.AI pins the resulting manifest-list DIGEST, never a tag.
+
+on:
+  push:
+    branches: [PMOVES.AI-Edition-Hardened]
+    tags: ['v*']
+  pull_request:
+    branches: [PMOVES.AI-Edition-Hardened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pmoves-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/powerfulmoves/pmoves-garage/garage
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Substituters and keys copied from upstream nix/nix.conf.
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            substituters = https://cache.nixos.org https://nix.web.deuxfleurs.fr
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix.web.deuxfleurs.fr:eTGL6kvaQn6cDR/F9lDYUIP9nCVR/kkshYfLDJf1yKs=
+
+      - name: Build static binary (upstream release recipe)
+        env:
+          ARCH: ${{ matrix.arch }}
+          GIT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: nix-build --attr "releasePackages.${ARCH}" --argstr git_version "${GIT_VERSION}"
+
+      - name: Check is static binary
+        run: nix-shell --attr ci --run "./script/not-dynamic.sh result/bin/garage"
+
+      - name: Integration tests
+        if: matrix.arch == 'amd64'
+        run: nix-shell --attr ci --run ./script/test-smoke.sh || (cat /tmp/garage.log; false)
+
+      # result/ is a symlink into /nix/store, which a build context cannot
+      # follow. Stage the real file at the path the upstream Dockerfile COPYs;
+      # the Dockerfile itself is used in place.
+      - name: Stage build context
+        run: |
+          mkdir -p ctx/result/bin
+          install -m 0755 "$(readlink -f result/bin/garage)" ctx/result/bin/garage
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (push by digest outside PRs)
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ctx
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish manifest list
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          n=$(find digests -type f | wc -l)
+          if [ "$n" -ne 2 ]; then
+            echo "::error::expected 2 per-arch digests (amd64, arm64), found $n"
+            exit 1
+          fi
+          tags=(-t "${IMAGE}:sha-${SHA}")
+          if [ "$REF_TYPE" = tag ]; then
+            tags+=(-t "${IMAGE}:${REF_NAME}")
+          else
+            tags+=(-t "${IMAGE}:hardened")
+          fi
+          refs=()
+          for f in digests/*; do refs+=("${IMAGE}@sha256:$(basename "$f")"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Record digest
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:sha-${SHA}"
+          digest=$(docker buildx imagetools inspect "${IMAGE}:sha-${SHA}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Pin in PMOVES.AI: \`${IMAGE}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
